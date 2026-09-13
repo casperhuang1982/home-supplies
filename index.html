@@ -1053,7 +1053,7 @@ function seedItems(){
 /* =========================================================
    條碼掃描
    ========================================================= */
-const BC_FORMATS=['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','codabar','qr_code'];
+const BC_FORMATS=['ean_13','ean_8','upc_a','upc_e','code_128','code_39','code_93','itf','codabar','qr_code'];
 let _zx=null;
 function loadZXing(){
   if(_zx) return _zx;
@@ -1061,18 +1061,72 @@ function loadZXing(){
     if(window.ZXing) return res(window.ZXing);
     const s=document.createElement('script');
     s.src='https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js';
-    s.onload=()=>window.ZXing?res(window.ZXing):rej(new Error('no global'));
-    s.onerror=()=>rej(new Error('cdn blocked'));
+    s.onload=()=>window.ZXing?res(window.ZXing):rej(new Error('ZXing 載入後找不到'));
+    s.onerror=()=>rej(new Error('連不到 CDN'));
     document.head.appendChild(s);
   });
   return _zx;
 }
+
+/* 辨識引擎。
+   陷阱：Windows 桌機版 Chrome 有 BarcodeDetector 這個「介面」，但底層沒有實作，
+   getSupportedFormats() 會回空陣列，而帶著空格式清單去 new 會直接拋錯。
+   所以判斷可用與否一定要看 getSupportedFormats() 的結果，不能用 'in window'。 */
+let _engine=null;
+async function getEngine(log){
+  if(_engine) return _engine;
+  const note=m=>{ if(log) log(m); };
+  if('BarcodeDetector' in window){
+    try{
+      const sup=await window.BarcodeDetector.getSupportedFormats();
+      const fmts=BC_FORMATS.filter(f=>sup.indexOf(f)>=0);
+      if(fmts.length){
+        const det=new window.BarcodeDetector({formats:fmts});
+        _engine={name:'瀏覽器內建',
+          detect:async src=>{ const r=await det.detect(src); return (r&&r.length)?r[0].rawValue:null; }};
+        return _engine;
+      }
+      note('這個瀏覽器沒有內建條碼辨識，改用 ZXing…');
+    }catch(e){ note('內建辨識無法啟動，改用 ZXing…'); }
+  }else note('載入辨識元件…');
+  const ZX=await loadZXing();
+  const reader=new ZX.BrowserMultiFormatReader();
+  _engine={name:'ZXing', zx:ZX, reader,
+    detect:async img=>{ try{ const r=await reader.decodeFromImageElement(img); return r?r.getText():null; }catch(e){ return null; } }};
+  return _engine;
+}
+
+/* 檔案 -> <img>（走 data: URL，blob: 在 Artifact 的 CSP 下可能被擋）。
+   手機照片動輒一兩千萬畫素，先縮到長邊 1600px，辨識才跑得動。 */
+function fileToImage(file){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onerror=()=>rej(new Error('檔案讀不到'));
+    r.onload=()=>{
+      const im=new Image();
+      im.onerror=()=>rej(new Error('不是有效的圖片'));
+      im.onload=()=>{
+        const max=1600, sc=Math.min(1,max/Math.max(im.width,im.height));
+        if(sc>=1) return res(im);
+        const cv=document.createElement('canvas');
+        cv.width=Math.round(im.width*sc); cv.height=Math.round(im.height*sc);
+        cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);
+        const im2=new Image();
+        im2.onload=()=>res(im2); im2.onerror=()=>res(im);
+        im2.src=cv.toDataURL('image/png');
+      };
+      im.src=r.result;
+    };
+    r.readAsDataURL(file);
+  });
+}
+
 function findByBarcode(code){ return DB.items.find(i=>i.barcode && i.barcode===code); }
 
 /** 開啟掃描器。onCode(code) 拿到條碼字串；不給就走預設「掃完記一筆」流程 */
 function openScanner(onCode){
   const handle = onCode || defaultScanAction;
-  let stream=null, raf=null, zxReader=null, stopped=false;
+  let stream=null, timer=null, watchdog=null, zxRunning=false, stopped=false;
 
   const ov=modal('📷 掃描條碼',`
     <div class="scanbox" id="sc_box"><div class="ph" id="sc_ph">正在啟動相機…</div>
@@ -1090,15 +1144,15 @@ function openScanner(onCode){
       </div></label>
   `,`<button class="btn" data-close>取消</button>`);
 
-  const box=ov.querySelector('#sc_box'), vid=ov.querySelector('#sc_video'),
-        ph=ov.querySelector('#sc_ph'), ret=ov.querySelector('#sc_ret'),
-        st=ov.querySelector('#sc_status');
+  const vid=ov.querySelector('#sc_video'), ph=ov.querySelector('#sc_ph'),
+        ret=ov.querySelector('#sc_ret'), st=ov.querySelector('#sc_status');
   const say=t=>{ st.textContent=t; };
 
   function stop(){
     stopped=true;
-    if(raf) cancelAnimationFrame(raf);
-    try{ if(zxReader) zxReader.reset(); }catch(e){}
+    if(timer) clearInterval(timer);
+    if(watchdog) clearTimeout(watchdog);
+    try{ if(zxRunning&&_engine&&_engine.reader) _engine.reader.reset(); }catch(e){}
     if(stream) stream.getTracks().forEach(t=>t.stop());
   }
   ov.addEventListener('click',e=>{ if(e.target===ov||e.target.hasAttribute('data-close')) stop(); },true);
@@ -1115,67 +1169,57 @@ function openScanner(onCode){
   (async()=>{
     if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
       ph.textContent='這個環境無法使用相機';
-      say('改用下面的「拍照辨識」或手動輸入。'); return;
+      say('請改用下面的「拍照辨識」或手動輸入。'); return;
     }
     try{
-      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}});
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}}});
     }catch(err){
-      ph.innerHTML='相機無法開啟<br><span style="font-size:11.5px">'+esc(err&&err.name||'')+'</span>';
-      say('可能是沒給權限、或這個頁面不允許用相機。請改用下面兩種方式。');
+      const n=(err&&err.name)||'';
+      ph.innerHTML='相機無法開啟<br><span style="font-size:11.5px">'+esc(n)+'</span>';
+      say(n==='NotAllowedError'?'相機權限被拒絕。請改用下面的拍照辨識或手動輸入。'
+                               :'這個頁面不能開相機。請改用下面的拍照辨識或手動輸入。');
       return;
     }
     if(stopped){ stream.getTracks().forEach(t=>t.stop()); return; }
     ph.hidden=true; vid.hidden=false; ret.hidden=false;
     vid.srcObject=stream; await vid.play().catch(()=>{});
 
-    if('BarcodeDetector' in window){
-      let det;
-      try{
-        const sup=await window.BarcodeDetector.getSupportedFormats();
-        det=new window.BarcodeDetector({formats:BC_FORMATS.filter(f=>sup.includes(f))});
-      }catch(e){ try{ det=new window.BarcodeDetector(); }catch(e2){ det=null; } }
-      if(det){
-        say('掃描中…（瀏覽器內建辨識）');
-        const tick=async()=>{
-          if(stopped) return;
-          try{ const r=await det.detect(vid); if(r&&r.length) return hit(r[0].rawValue); }catch(e){}
-          raf=requestAnimationFrame(tick);
-        };
-        raf=requestAnimationFrame(tick); return;
-      }
+    let eng;
+    try{ eng=await getEngine(say); }
+    catch(e){ say('辨識元件載不到（'+((e&&e.message)||'')+'）。請用手動輸入。'); return; }
+    if(stopped) return;
+
+    watchdog=setTimeout(()=>{
+      if(!stopped) say('掃不到？讓條碼填滿框線、鏡頭拉遠一點對焦，或改用下面的拍照辨識。');
+    },15000);
+
+    if(eng.name==='ZXing'){
+      zxRunning=true;
+      say('掃描中…（ZXing）');
+      eng.reader.decodeFromVideoElement(vid,res=>{ if(res) hit(res.getText()); });
+      return;
     }
-    say('載入辨識元件…');
-    try{
-      const ZX=await loadZXing();
-      if(stopped) return;
-      zxReader=new ZX.BrowserMultiFormatReader();
-      say('掃描中…');
-      zxReader.decodeFromVideoElement(vid,(res,err)=>{ if(res) hit(res.getText()); });
-    }catch(e){
-      say('辨識元件載不到（可能沒網路）。請改用手動輸入。');
-    }
+    say('掃描中…（'+eng.name+'）');
+    timer=setInterval(async()=>{
+      if(stopped||vid.readyState<2) return;
+      try{ const c=await eng.detect(vid); if(c) hit(c); }catch(e){}
+    },150);
   })();
 
   /* --- 拍照辨識 --- */
   ov.querySelector('#sc_photo').addEventListener('change',async e=>{
     const f=e.target.files[0]; if(!f) return;
-    say('辨識照片中…');
-    const url=URL.createObjectURL(f);
-    try{
-      if('BarcodeDetector' in window){
-        const img=await createImageBitmap(f);
-        const det=new window.BarcodeDetector({formats:BC_FORMATS});
-        const r=await det.detect(img);
-        if(r&&r.length){ URL.revokeObjectURL(url); return hit(r[0].rawValue); }
-      }
-      const ZX=await loadZXing();
-      const r=await new ZX.BrowserMultiFormatReader().decodeFromImageUrl(url);
-      URL.revokeObjectURL(url);
-      return hit(r.getText());
-    }catch(err){
-      URL.revokeObjectURL(url);
-      say('這張照片沒辨識出條碼，試著拍近一點、對焦清楚，或手動輸入。');
-    }
+    if(watchdog){ clearTimeout(watchdog); watchdog=null; }
+    let img,eng;
+    try{ say('讀取照片中…'); img=await fileToImage(f); }
+    catch(err){ say('照片讀不到：'+((err&&err.message)||'')); return; }
+    try{ eng=await getEngine(say); }
+    catch(err){ say('辨識元件載不到（'+((err&&err.message)||'')+'）。請用手動輸入。'); return; }
+    say('辨識中…（'+eng.name+'）');
+    let code=null;
+    try{ code=await eng.detect(img); }catch(err){ code=null; }
+    if(code) return hit(code);
+    say('這張照片沒辨識出條碼。試著讓條碼佔滿畫面、對焦清楚、避免反光，或直接手動輸入。');
   });
 
   /* --- 手動輸入 --- */
