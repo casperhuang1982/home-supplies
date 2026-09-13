@@ -1,0 +1,12 @@
+# 建置產物：由 build-artifact.py 從 index.html 產生。
+# 它沒有 <html>/<head> 外殼（Claude Artifact 平台發佈時才補上），
+# 不能當成一般網頁使用，所以不進版控。
+artifact.html
+
+# 編輯器 / 作業系統
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*.swp
+*~
