@@ -1126,7 +1126,7 @@ function findByBarcode(code){ return DB.items.find(i=>i.barcode && i.barcode===c
 /** 開啟掃描器。onCode(code) 拿到條碼字串；不給就走預設「掃完記一筆」流程 */
 function openScanner(onCode){
   const handle = onCode || defaultScanAction;
-  let stream=null, timer=null, watchdog=null, zxRunning=false, stopped=false;
+  let stream=null, timer=null, watchdog=null, stopped=false;
 
   const ov=modal('📷 掃描條碼',`
     <div class="scanbox" id="sc_box"><div class="ph" id="sc_ph">正在啟動相機…</div>
@@ -1152,7 +1152,6 @@ function openScanner(onCode){
     stopped=true;
     if(timer) clearInterval(timer);
     if(watchdog) clearTimeout(watchdog);
-    try{ if(zxRunning&&_engine&&_engine.reader) _engine.reader.reset(); }catch(e){}
     if(stream) stream.getTracks().forEach(t=>t.stop());
   }
   ov.addEventListener('click',e=>{ if(e.target===ov||e.target.hasAttribute('data-close')) stop(); },true);
@@ -1193,17 +1192,40 @@ function openScanner(onCode){
       if(!stopped) say('掃不到？讓條碼填滿框線、鏡頭拉遠一點對焦，或改用下面的拍照辨識。');
     },15000);
 
-    if(eng.name==='ZXing'){
-      zxRunning=true;
-      say('掃描中…（ZXing）');
-      eng.reader.decodeFromVideoElement(vid,res=>{ if(res) hit(res.getText()); });
-      return;
-    }
     say('掃描中…（'+eng.name+'）');
+
+    /* 刻意不用 ZXing 的 decodeFromVideoElement()：它靠 'playing' 事件啟動解碼迴圈，
+       但影片若已經在播（我們為了顯示預覽會先 play），它的 tryPlayVideo() 會提早 return，
+       'playing' 不再觸發，解碼迴圈永遠不會開始 —— 畫面看得到卻掃不到。
+       改成自己定時抓格，餵給跟「拍照辨識」同一條已驗證可用的路徑。 */
+    const useCanvas = eng.name==='ZXing';
+    const cap = useCanvas?document.createElement('canvas'):null;
+    let busy=false;
+
+    async function frameToImage(){
+      const w=vid.videoWidth, h=vid.videoHeight;
+      if(!w||!h) return null;
+      const sc=Math.min(1,1280/Math.max(w,h));
+      cap.width=Math.round(w*sc); cap.height=Math.round(h*sc);
+      cap.getContext('2d').drawImage(vid,0,0,cap.width,cap.height);
+      const img=new Image();
+      img.src=cap.toDataURL('image/jpeg',0.92);
+      if(img.decode){ try{ await img.decode(); }catch(e){ return null; } }
+      else await new Promise(r=>{ img.onload=r; img.onerror=r; });
+      return img.width?img:null;
+    }
+
     timer=setInterval(async()=>{
-      if(stopped||vid.readyState<2) return;
-      try{ const c=await eng.detect(vid); if(c) hit(c); }catch(e){}
-    },150);
+      if(stopped||busy||vid.readyState<2) return;
+      busy=true;
+      try{
+        let code=null;
+        if(useCanvas){ const img=await frameToImage(); if(img) code=await eng.detect(img); }
+        else code=await eng.detect(vid);
+        if(code) hit(code);
+      }catch(e){}
+      busy=false;
+    }, useCanvas?300:150);
   })();
 
   /* --- 拍照辨識 --- */
